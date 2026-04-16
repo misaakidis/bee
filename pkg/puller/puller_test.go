@@ -560,6 +560,66 @@ func TestSyncErrorBackoff(t *testing.T) {
 	}
 }
 
+// TestRadiusDecreaseRecalcPeersLiveness verifies that after a radius decrease
+// a new sync worker starts within a tight deadline, regardless of how long
+// existing goroutines take to drain after context cancellation.
+func TestRadiusDecreaseRecalcPeersLiveness(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bins          = 4
+		initialRadius = 3 // narrow neighbourhood: only bin 3 syncs initially
+		newRadius     = 0 // radius decrease: all bins must be resynced
+		cancelDelay   = 300 * time.Millisecond
+		deadline      = 100 * time.Millisecond
+	)
+
+	base := swarm.RandAddress(t)
+	// peer PO matches initialRadius so it participates both before and after.
+	peerAddr := swarm.RandAddressAt(t, base, initialRadius)
+
+	rs := resMock.NewReserve(resMock.WithRadius(initialRadius))
+
+	_, _, kad, ps := newPulleAddr(t, base, opts{
+		kad: []kadMock.Option{
+			kadMock.WithEachPeerRevCalls(kadMock.AddrTuple{Addr: peerAddr, PO: initialRadius}),
+		},
+		pullSync: []mockps.Option{
+			mockps.WithCursors(make([]uint64, bins), 0),
+			mockps.WithSyncCancelDelay(cancelDelay),
+		},
+		bins: bins,
+		rs:   rs,
+	})
+
+	kad.Trigger()
+
+	// Wait for the initial sync goroutine (bin 3 only, since radius=3) to be in-flight.
+	err := spinlock.Wait(time.Second, func() bool {
+		return ps.TotalSyncCalls() >= 1
+	})
+	if err != nil {
+		t.Fatal("timed out waiting for initial sync goroutine to start")
+	}
+
+	snapshot := ps.TotalSyncCalls()
+
+	// Radius decrease triggers disconnectPeer for all peers. On unpatched code
+	// this blocks in wg.Wait until the in-flight goroutine drains (~cancelDelay).
+	rs.SetStorageRadius(newRadius)
+	t0 := time.Now()
+	kad.Trigger()
+
+	// After disconnect+recalcPeers, new workers for all bins must start.
+	err = spinlock.Wait(deadline, func() bool {
+		return ps.TotalSyncCalls() > snapshot
+	})
+	elapsed := time.Since(t0)
+	if err != nil {
+		t.Fatalf("new sync worker did not start within %v after radius decrease (elapsed %v)", deadline, elapsed)
+	}
+}
+
 func TestPeerGone(t *testing.T) {
 	t.Parallel()
 
