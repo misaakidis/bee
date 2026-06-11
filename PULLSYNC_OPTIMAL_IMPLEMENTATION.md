@@ -56,8 +56,8 @@ loses an optimality bound). Plus the LIVE obligation (§5.6).
 | # | Doc | Mechanism | Where it lives in this PR | Tier |
 |---|---|---|---|---|
 | 1 | §5.1 | **Multi-source ≥2**: each missing chunk has ≥2 candidate holders; one fetch at a time, the rest are fallbacks | scheduler: `holders[chunk] = set of peers that offered it` | gate-critical (O1, O6) |
-| 2 | §5.2 | **Chunk-level dedup**: one shared, **chunk-address-keyed** in-flight set; check-and-mark is **one indivisible step** | scheduler: `inFlight map[address]peer`, consulted+set atomically before issuing a `Want` | gate-critical (O3) |
-| 3 | §5.4 | **Failover-with-exclude**: on stall, try the next holder and **permanently exclude** the staller *for that chunk* | scheduler: `excluded[chunk] = set of peers barred for it` | gate-critical (O1, O6) |
+| 2 | §5.2 | **Chunk-level dedup**: one shared, **triple-keyed** in-flight set; check-and-mark is **one indivisible step** | scheduler: `inFlight map[triple]peer`, consulted+set atomically before issuing a `Want` | gate-critical (O3) |
+| 3 | §5.4 | **Failover-with-exclude-and-reset**: on stall try the next holder and **bar** the staller *for that chunk*; **clear a chunk's bars once they cover every current holder** (`ResetOnExhaust`) | scheduler: `excluded[triple] = barred peers`; reset when `holders\excluded = ∅` | gate-critical (O1, O6) |
 | 4 | §5.3 | **Load-aware routing**: among a chunk's holders, fetch from the **least-loaded**; ties broken by proximity (latency) | scheduler: per-peer outstanding-fetch counter; pick `argmin load` over `holders[c] \ excluded[c]` | floor-achieving (O5) |
 | 5 | §5.5 | **Deepest-first**: fetch the deepest (highest-PO, nearest) bins first | scheduler: iterate bins high→low | floor-achieving (O2) |
 | 6 | §5.6 | **LIVE**: every chunk arriving after the cursor is also pulled | per-bin live subscription continues past the cursor | regime obligation |
@@ -71,21 +71,21 @@ mutator of the in-flight set. The test `TestOptimal_ConcurrentWantsDedupToOneFet
 this: two holders offering the same chunk must produce **one** want in flight, hence one
 delivery; splitting check-and-mark is the doc's `MC_nonatomic` double-fetch.
 
-### The `(address, batchID, stampHash)` triple vs. the address (read §5.2 and §11 of the doc)
+### The identity is the `(address, batchID, stampHash)` triple — NOT the bare address
 
-- **Dedup / move** keys on the **chunk address** (content self-verifies; identical bytes move
-  once). This is what mechanism 2 dedups on.
-- **Completeness / "do I have it"** keys on the full **triple** — `storer.ReserveHas(addr,
-  batchID, stampHash)`. The reserve is postage-accounted per triple.
+The model's `Chunk` maps to the **triple**, and **everything keys on the triple**: `got` ≙
+`ReserveHas(addr,batchID,stampHash)`, the in-flight claim set, `Want`/`Deliver`/`conflict`,
+completeness. This is the correct key for *this* PR, and it still captures the entire headline
+`k×` saving — in the common case all `k` peers offer the **same triple** (one batch stamped the
+chunk and it propagated), so a triple-keyed claim dedups all `k` offers to one fetch.
 
-So: the *local-have* check and the *want* decision use the triple (as today), but the
-*cross-peer in-flight* dedup keys on the address. In the full-replication common case the triple
-and the address coincide; the divergence (re-stamped content) is the §11 deferred item — **do not
-implement the stamp-only fetch here**, just don't let the address-keyed in-flight set incorrectly
-suppress a genuinely-needed different-triple entry. Practical rule: in-flight set keyed on
-address is a *delivery* dedup (don't fetch the same bytes twice concurrently); the per-triple
-`ReserveHas` is the *completeness* check. A chunk is "missing" iff `ReserveHas(triple)==false`;
-it is "fetchable now" iff missing **and** its address is not already in-flight.
+Address-level **byte** dedup — "the same bytes under a *second* batch's stamp move only once" — is
+a **separate, deferred layer (§11)**: it needs a *stamp-only fetch* (fetch the 113-byte stamp when
+the 4 kB bytes are already held) and the model extension *payload-exactly-once*. **Do not implement
+it here.** Crucially, **do not key the claim on the bare address** as a shortcut: an in-flight
+chunk for triple `T1` would then wrongly suppress a genuinely-needed second triple `T2` for the
+same address, and per-triple completeness fails. Triple-key the claim; defer the byte saving.
+(Decision: this is the single latent-bug fix from review — claim on the triple.)
 
 ---
 
@@ -203,58 +203,78 @@ chunk eventually routed) and `Completeness`/`Freshness` carry over too.
 ### 4.2 The pure state machine (`pkg/puller/internal/pullstate`)
 
 A pure type — no I/O, no goroutines, no locks, **not safe for concurrent use** (one goroutine
-drives it, exactly like the swip-25d scheduler). Variables map 1:1 to `PullSyncerE`:
+drives it, exactly like the swip-25d scheduler). The model's `Chunk` ≙ the **triple** (§2). Variables
+map 1:1 to `PullSyncerE`:
 
 | `PullSyncerE.tla` | `pullstate` (Go) | meaning |
 |---|---|---|
-| `got ⊆ Chunks` | `got map[addr]struct{}` (mirrors `ReserveHas`) | fetched + stored (terminal) |
-| `want ∈ [Chunks→SUBSET Peers]` | `want map[addr]peerKey` (Dedup ⇒ ≤1) | the in-flight **claim set** (§5.2) |
-| `failed ∈ [Chunks→SUBSET Peers]` | `excluded map[addr]set[peerKey]` | per-chunk failover log (§5.4) |
-| `arrived ⊆ Chunks` | `arrived map[addr]…` | available to fetch (HIST at init; LIVE via `NewChunk`) |
+| `got ⊆ Chunks` | `got map[triple]struct{}` (mirrors `ReserveHas`) | fetched + stored (terminal) |
+| `want ∈ [Chunks→SUBSET Peers]` | `want map[triple]peerKey` (Dedup ⇒ ≤1) | the in-flight **claim set** (§5.2) |
+| `failed ∈ [Chunks→SUBSET Peers]` | `excluded map[triple]set[peerKey]` | per-chunk failover log (§5.4) |
+| `arrived ⊆ Chunks` | `arrived map[triple]…` | available to fetch (HIST at init; LIVE via `NewChunk`) |
 | `conflict ∈ BOOLEAN` | `conflict bool` | **must stay false**; latched on any double-deliver — a bug detector |
-| `Holds[p]` (fixed) | `holders map[addr]set[peerKey]` (built from Offers) | who holds/offered each chunk |
+| `holds ∈ [Peers→SUBSET Chunks]` | `holders map[triple]set[peerKey]` (built/updated from Offers) | who currently offers each chunk (was `Holds`, now mutable under churn) |
 | `Prio[c]` | bin number (deeper = higher) | priority key for `PrioOK` |
+| `ndeliv ∈ Nat` | a delivery counter | `DeliveryFloor`: must equal `\|got\|` (no double-fetch) |
+
+`tmo`/`chn` (the `TimeoutBudget`/`ChurnBudget` counters) are **not state you implement** — see §4.3:
+in the real system spurious timeouts and churn simply *happen*; the budgets are the model's way of
+bounding them for the proof, not knobs to build.
 
 Plus the per-peer routing state the model abstracts away: `load map[peerKey]int` (outstanding
 assigned fetches, for §4.4 least-loaded). And, as today, the persisted per-`(peer,bin)`
 `intervalstore.Intervals` high-water (HIST resume; keep `IntervalPrefix="sync_interval"`, no
 migration).
 
-The knobs are a `Config` mirroring the `CONSTANT`s — **production defaults in bold**, the others
-exist so the tests can ablate:
+The knobs are a `Config` mirroring the `CONSTANT`s — **production values in the comment**, the
+others exist so the tests can ablate:
 
 ```go
 type Config struct {
-    Dedup        bool // §5.2  — true
-    Failover     bool // §5.4  — true
-    Exclude      bool // §5.4  — true
-    SingleSource bool // §5.1  — false (true is a *disqualified* ablation; never ship true)
-    Priority     bool // §5.5  — true (deepest-first; correctness-neutral, so optional but on)
-    EnableLive   bool // §5.6  — true
+    Dedup          bool // §5.2  — true
+    Failover       bool // §5.4  — true
+    Exclude        bool // §5.4  — true
+    ResetOnExhaust bool // §5.4  — true  (clear a chunk's bars once they cover every current holder)
+    SingleSource   bool // §5.1  — false (true is a *disqualified* ablation; never ship true)
+    Priority       bool // §5.5  — true  (deepest-first; correctness-neutral, so optional but on)
+    EnableLive     bool // §5.6  — true
 }
 ```
+
+`ResetOnExhaust` is **gate-critical, newly so**: the model now shows (`MC_noreset`) that permanent
+per-chunk bars + a single timeout misfire on a chunk's only holder makes the chunk unfetchable
+forever — Completeness fails. Once stall attribution can err (it always can — §4.3), bars **must**
+clear when they cover every current holder. Ship it `true`.
 
 ### 4.3 The actions (translate verbatim — same guards)
 
 Each TLA action becomes one method; each conjunct becomes one guard. Do not paraphrase the guards —
 copy them.
 
-| `PullSyncerE` action | `pullstate` method | the guard (`Claimable` etc.) |
+| `PullSyncerE` action | `pullstate` method | the guard / effect |
 |---|---|---|
-| `Want(c,p)` | `Want(addr, peer) (ok bool)` | `Claimable`: `c∈arrived ∧ c∈Holds[p] ∧ c∉got ∧ p∉want[c] ∧ p∉failed[c] ∧ (Dedup⇒want[c]={}) ∧ (SingleSource⇒p=Assign[c]) ∧ (c∈Live⇒EnableLive) ∧ PrioOK(c)` |
-| `Deliver(c,p)` | `Deliver(addr, peer)` | `p∈Honest ∧ p∈want[c]`; sets `got∪={c}`, **latches `conflict` if `c∈got` already**, clears `want[c]` |
-| `ByzStall(c,p)` | `Stall(addr, peer)` | `p∈want[c] ∧ Failover`; clears `want[c]`, and **if `Exclude`** adds `p` to `failed[c]` |
-| `NewChunk(c)` | `NewChunk(addr)` | `c∈LiveChunks ∧ c∉arrived`; `arrived∪={c}` |
-| `PrioOK(c)` | `prioOK(addr) bool` | `¬Priority ∨ ∀d∈arrived: Prio[d]>Prio[c] ⇒ Addressed(d)` (deepest-first) |
+| `Want(c,p)` | `Want(c, peer) (ok bool)` | `Claimable`: `c∈arrived ∧ c∈holds[p] ∧ c∉got ∧ p∉want[c] ∧ p∉failed[c] ∧ (Dedup⇒want[c]={}) ∧ (SingleSource⇒p=Assign[c]) ∧ (c∈Live⇒EnableLive) ∧ PrioOK(c)` |
+| `Deliver(c,p)` | `Deliver(c, peer)` | `p∈want[c]`; `got∪={c}`, **latches `conflict` if `c∈got`**, clears `want[c]`, `ndeliv++` |
+| `ByzStall(c,p)` **and** `SpuriousTimeout(c,p)` | **one** `Stall(c, peer)` | `p∈want[c] ∧ Failover`; clears `want[c]`, **if `Exclude`** adds `p` to `failed[c]`. The two model actions are **the same method** — see note below |
+| `ResetExcluded(c)` | `resetExcluded(c)` | `ResetOnExhaust ∧ c∈arrived ∧ c∉got ∧ want[c]={} ∧ failed[c]≠{} ∧ (∀p: c∈holds[p] ⇒ p∈failed[c])`; clears `failed[c]` |
+| `Lose(c,p)` / `Gain(c,p)` | (no method) — holdings update via re-Offer | churn is *observed* (a later Offer differs), not an action you call; releases the claim if a held-claim is lost. See §4.5 |
+| `NewChunk(c)` | `NewChunk(c)` | `c∈LiveChunks ∧ c∉arrived`; `arrived∪={c}` |
+| `PrioOK(c)` | `prioOK(c) bool` | `¬Priority ∨ ∀d∈arrived: Prio[d]>Prio[c] ⇒ Addressed(d)` (deepest-first) |
 
 Translation notes that matter:
 - **`Deliver`'s `conflict` latch is your runtime double-fetch detector.** In the model it's how the
   ablation fails; in production it must never fire — wire it to a metric/`logger.Error` and treat a
-  trip as a bug. This is the `ConflictFree` invariant made observable.
-- **"Byzantine" / "Honest" are not knowable at runtime.** The model labels a non-delivering peer
-  Byzantine; the implementation just observes *a `Fetch` that didn't deliver `c`* and calls
-  `Stall`. Any non-delivery (omission, timeout, error, peer gone) maps to `ByzStall`. An honest
-  delivery maps to `Deliver`. You never classify peers — you react to outcomes.
+  trip as a bug. This is the `ConflictFree`/`DeliveryFloor` invariant made observable (and
+  `ndeliv == |got|`).
+- **`ByzStall` and `SpuriousTimeout` collapse to one `Stall` — this is the point of the model
+  update.** The implementation *cannot tell* a Byzantine staller from a slow-but-honest peer
+  (`SpuriousTimeout` is "the same timeout machinery misfiring on an honest peer"). So **any
+  non-delivery — omission, timeout, transient error, peer-gone — is one `Stall`**, and you never
+  classify peers. The consequence is exactly why `ResetOnExhaust` is now gate-critical: because
+  `Stall` may have barred an *honest* holder by mistake, bars must be able to clear (`MC_noreset`
+  proves permanent bars + one misfire = lost chunk). `NoFalseExclusion` is the *idealised*
+  `TimeoutBudget=0` corner (perfect attribution); the real puller lives at `TimeoutBudget>0`, so
+  build for misfires.
 - **`SingleSource` stays false in production.** It is the disqualified family (`MC_single_*`). Keep
   it only as a test knob to reproduce the disqualification.
 - The state machine exposes a **`Step()`** (or `Claimable`-enumerator) that returns the set of
@@ -287,22 +307,40 @@ abstract actions and the wire:
 | shell event | becomes | state-machine call |
 |---|---|---|
 | peer connects / `Offer` returns | learn holdings; HIST chunks available | populate `holders`/`arrived`; `Step()` |
-| `Offer` returns a post-cursor chunk | LIVE arrival | `NewChunk(addr)` then `Step()` |
-| `OpFetch` → `pullsync.Fetch` succeeds for `c` | honest delivery | `Deliver(addr, peer)` |
-| `Fetch` fails / times out / peer gone for `c` | non-delivery | `Stall(addr, peer)` |
+| `Offer` returns a post-cursor chunk | LIVE arrival | `NewChunk(c)` then `Step()` |
+| `Fetch` delivered `c` from `p` | honest delivery | `Deliver(c, p)` |
+| `Fetch` did **not** deliver `c` (error/timeout/short/gone) | non-delivery | `Stall(c, p)` |
+| a re-`Offer` shows `p` no longer holds a claimed `c` | churn (`Lose`) | release the claim (`Stall(c,p)` semantics, no bar); `Step()` |
+| `holders[c] \ excluded[c] = ∅` while `c` missing | exhausted | `resetExcluded(c)` then `Step()` |
 | topology / radius change | re-tile | update radius; re-`Step()` (§4.7) |
 
-`pullsync.Fetch` returns an aggregate count, not per-chunk outcomes. The clean mapping: **fetch one
-peer's assigned subset; a `Fetch` error is a `Stall` for every `c` in that subset** (each then
-re-routes to another holder next `Step()`), and the chunks it did deliver are `Deliver`ed (match by
-address — deliveries carry their address). If you want crisper feedback, have `Fetch` return the
-addresses it delivered (a Go-API addition, no wire change). **Pick one, document it, test it.**
+**Failover is per-chunk (follow the model).** The model's `Stall` is per-`(c,p)`, so `pullsync.Fetch`
+**must report per-chunk outcomes** — return the set of `(triple)`s it actually delivered (a Go-API
+addition, no wire change, since each delivery carries its triple). The shell then maps **each
+delivered `c` → `Deliver(c,p)`** and **each assigned-but-undelivered `c` → `Stall(c,p)`**. Do **not**
+collapse a `Fetch` error into "stall the whole subset" — that would bar an honest peer for chunks it
+would have served, coarser than the verified model. Batching chunks into one `Fetch` call is fine
+*because* the outcomes are reported per chunk.
+
+**Churn and re-discovery.** Holdings move (`Lose`/`Gain`): a peer evicts a chunk, or a neighbour
+that just completed its own fetch now offers one. The implementation absorbs this naturally —
+discovery re-`Offer`s each round and rebuilds `holders` from the *current* offer, so a `Gain`
+appears as a new candidate and a `Lose` as a vanished one. If a `Lose` strips a peer that holds a
+live claim, release it (the wire fetch will time out anyway → `Stall`, but with no bar, since the
+peer didn't misbehave). The model guarantees `SupplyInv` (≥1 honest holder survives), so a re-route
+always exists; if it ever doesn't, that chunk is a push-sync availability failure (§6.1), not a pull
+bug — log it, don't spin.
+
+**`ResetExcluded` in practice.** Because a `Stall` may have barred an honest holder by mistake
+(§4.3), the shell must clear a chunk's bars once they cover *every current holder* — otherwise the
+chunk is stuck (the `MC_noreset` failure). Realize it as a cooldown / fresh-retry round, re-checked
+after each `Offer` rebuild (holders can also reappear via churn).
 
 Discovery detail: for each eligible peer `p` (proximity ≥ bin, bin ≥ radius) a worker calls
 `Offer(p, bin, start_p)` with `p`'s persisted high-water `start_p`. `start_p` is **per-peer**
 because BinIDs are assigned independently by each peer (a chunk is BinID 5 at one peer, 9 at
-another). Dedup keys on **address** (global, correct); only the resume bookkeeping is per-peer —
-see the interval invariant in §4.6.
+another). The claim/dedup keys on the **triple** (global, correct — §2); only the resume bookkeeping
+is per-peer — see the interval invariant in §4.6.
 
 ### 4.6 The interval-advance invariant (correctness-critical — get this right)
 
@@ -349,6 +387,41 @@ Keep it simple and faithful to the doc. The gate-critical mechanism is **exclude
 blocklist** — that was a `swip-25d` addition. If you add one, make it a clearly-labelled
 operational safeguard with a cooldown, not part of the core correctness story, and keep it behind
 a tunable in `Options` (default off or generous). Don't let it gold-plate the PR.
+
+### 4.10 Concurrency surfaces (the refinement seams the matrix does NOT cover)
+
+The model is a single-process state machine over interleaved atomic actions; the implementation is
+concurrent. Single-goroutine ownership of `pullstate` serializes **every scheduling-state mutation**
+(`want`/`holders`/`arrived`/`excluded`/`load`/`got`), which is what discharges the one atomicity
+obligation (§4.8) and what the model's "one step at a time" assumes. But the refinement crosses
+several seams the TLC proof does **not** see — enumerate them here so what is unverified is explicit,
+not diffuse:
+
+1. **`want` check-and-mark** — the only concurrency surface the *model* exposes (`PullSyncerNA`).
+   Serialized by single-goroutine ownership (§4.8). ✔ covered.
+2. **The store vs the model's `got`.** `got` ≙ `ReserveHas`, but the reserve is also written by Fetch
+   **workers**, by **push-sync**, and shrunk by **eviction** — concurrently, outside the model.
+   Consequences: (a) the `conflict` tripwire must distinguish a *pull double-fetch* from "already
+   present from push-sync," or it false-positives; (b) a chunk can become held between the `Want`
+   decision and the `Fetch` (benign — a wasted fetch). Treat `pullstate.got` as the scheduler's
+   *view*, reconciled from `ReserveHas`/delivery, not the ground truth.
+3. **Incremental holder discovery.** The model fixes `Holds` (then churns it with `Lose`/`Gain`); the
+   implementation *learns* `holders` from Offers arriving over time. So the scheduler routes and
+   bars on **partial** knowledge — a chunk can look single-source and get barred before a second
+   holder's Offer lands. `ResetOnExhaust` (§4.3) + re-`Offer` each round is what keeps this from
+   becoming a stuck chunk; it is the implementation's answer to "`Holds` is not actually known up
+   front."
+4. **Worker cancellation vs in-flight results.** A `(peer,bin)` worker may be cancelled (radius
+   change, disconnect) while a result is in flight. Use **generation tokens** (as master/swip-25d
+   do) so the control goroutine drops `Deliver`/`Stall` reports from a superseded worker — else a
+   stale `Deliver` mutates state for a chunk the scheduler has moved on from.
+5. **Statestore intervals + cursor cache.** Genuinely shared between the control goroutine and
+   workers; guard with a mutex (the *only* locks in the design). Keep them off the model's
+   correctness path — they are resume bookkeeping, not scheduling state.
+
+Seam 1 is proven; 2–5 are implementation obligations the matrix cannot reach. Each deserves a
+race-tested integration test (§8.2); none should leak into `pullstate`, which stays pure and
+single-threaded.
 
 ---
 
@@ -421,16 +494,24 @@ Functional (map to the doc's objectives and §9 machine-checked properties):
 2. **O1 / completeness (`Completeness`).** Every chunk held by ≥1 honest neighbour is eventually
    fetched, including under an omitting/stalling peer and under partial holdings (a chunk on a
    single holder).
-3. **O6 / failover-with-exclude.** A stalling holder is excluded per chunk and the fetch succeeds
-   from another holder; a single source that withholds does **not** stall completeness.
+3. **O6 / failover-with-exclude-and-reset.** A stalling holder is barred per chunk and the fetch
+   succeeds from another; a single source that withholds does **not** stall completeness; **and a
+   spurious timeout that bars an honest holder is recovered** — when a chunk's bars cover every
+   current holder they clear (`ResetOnExhaust`), so a misfire costs a round, not the chunk
+   (`MC_noreset` is the negative).
 4. **Freshness (LIVE).** A chunk arriving after the start-cursor is eventually fetched.
-5. **O5 / load.** Across a HIST drain with `M ≫ k` fully-replicated chunks, per-peer serve counts
+5. **Churn (`SupplyInv`).** Under bounded holdings churn (a claimed holder drops a chunk mid-flight)
+   the node still completes, and an honest peer is never barred *by* churn.
+6. **O5 / load.** Across a HIST drain with `M ≫ k` fully-replicated chunks, per-peer serve counts
    are within ~1 of `M/k` (free-choice balance, §5.3).
-6. **O2 / order.** Deeper bins are scheduled before shallower ones.
-7. **No regressions:** radius increase/decrease, epoch reset, peer disconnect/gone, interval
+7. **O2 / order.** Deeper bins are scheduled before shallower ones.
+8. **Store invariants:** `ndeliv == |got|` (`DeliveryFloor` — no double-fetch), the store only grows
+   (`Monotone`), no claim leaks past completion (`Quiescence`), every claim is on a current,
+   non-barred holder (`ClaimsLive`). Wire these as runtime assertions/metrics where cheap.
+9. **No regressions:** radius increase/decrease, epoch reset, peer disconnect/gone, interval
    persistence/resume all behave as the master tests assert (port those tests).
-8. `go build ./...`, `make lint`, `make test` (and `-race`) green; `goleak` clean (the
-   `main_test.go` `TestMain` stays).
+10. `go build ./...`, `make lint`, `make test` (and `-race`) green; `goleak` clean (the
+    `main_test.go` `TestMain` stays).
 
 Non-functional: no wire/`.proto` change; statestore interval format unchanged (no migration);
 `puller.New`/`pullsync.New` signatures unchanged if at all possible.
@@ -445,31 +526,39 @@ Two layers. The first is the one that makes "runs as in the TLA models" concrete
 
 Unit-test the pure `pullstate` machine (§4.2) against **the same config matrix as
 `optimal-testbed/run.sh`** — same knobs, same expected outcomes. This is the Go analogue of the
-model checker: drive the machine through interleavings, assert the invariant
-(`conflict==false`) holds (positives) or breaks (ablations), and that the deficit reaches zero
-(`Completeness`) or doesn't (the failover/single-source ablations), and that LIVE arrivals are
-delivered (`Freshness`) or aren't (`MC_no_live`). Because the machine is pure and tiny, the test
-can either enumerate interleavings exhaustively for `k=2,3` (a hand-rolled BFS over enabled
-actions — the closest thing to TLC in Go) or drive randomized schedules with a seed.
+model checker: drive the machine through interleavings and assert the **safety invariants** hold
+(`conflict==false`, `ndeliv==|got|`, `DedupInv`, `ClaimsLive`, `SupplyInv`, `NoFalseExclusion`) and
+the **liveness** properties resolve (`Completeness`/`Freshness`/`Quiescence` — or, for an ablation,
+the one that's expected to break). Because the machine is pure and tiny, enumerate interleavings
+exhaustively for `k=2,3` (a hand-rolled BFS over enabled actions — the closest thing to TLC in Go)
+or drive seeded random schedules. **Match `run.sh` row-for-row** — keep this table in lockstep with
+it.
 
-| Go test case | knob delta from all-on | expect | mirrors |
+| Go test case | knob / scenario delta from all-on | expect | mirrors |
 |---|---|---|---|
-| `base` | — (full repl, honest) | `conflict==false`, deficit→0 | `MC_base` |
+| `base` | full repl, honest | invariants hold, deficit→0 | `MC_base` |
 | `partial` | one chunk on a single holder | same | `MC_partial` |
 | `omission` | one holder never delivers (→`Stall`) | same (repaired by failover) | `MC_omission` |
-| `vicinity` | `Priority=true` | same (order is correctness-neutral) | `MC_vicinity` |
+| `vicinity` | `Priority=true` | same (order correctness-neutral) | `MC_vicinity` |
 | `live` | a `NewChunk` after init | same + `Freshness` | `MC_live` |
-| `nodedup` | `Dedup=false` | **`conflict` latches** | `MC_nodedup` |
-| `nofailover` | `Failover=false` + omitter | **deficit stuck >0** | `MC_nofailover` |
-| `noexclude` | `Exclude=false` + omitter | **deficit stuck >0** (re-grab livelock) | `MC_noexclude` |
-| `single_omission` | `SingleSource=true`, assigned=omitter | **deficit stuck >0** | `MC_single_omission` |
-| `single_partial` | `SingleSource=true`, assigned lacks it | **deficit stuck >0** | `MC_single_partial` |
+| `timeout` | `TimeoutBudget=2`, single-holder chunk, `ResetOnExhaust=true` | same (misfire costs a round) | `MC_timeout` |
+| `churn` | `ChurnBudget=2` + omitter | same + `SupplyInv` | `MC_churn` |
+| `storm` | k=4 composite: omitter+stall, LIVE-deepest, single-holder, 1 timeout, 1 churn | all hold | `MC_storm` |
+| `scale` | k=6, two Byzantine omitters | all hold | `MC_scale` |
+| `nodedup` | `Dedup=false` | **`ConflictFree` breaks** | `MC_nodedup` |
+| `nofailover` | `Failover=false` + omitter | **`Completeness` fails** | `MC_nofailover` |
+| `noexclude` | `Exclude=false` + omitter | **`Completeness` fails** (re-grab livelock) | `MC_noexclude` |
+| `noreset` | `ResetOnExhaust=false`, `TimeoutBudget=1`, single-holder | **`Completeness` fails** (permanent bar) | `MC_noreset` |
+| `single_omission` | `SingleSource=true`, assigned=omitter | **`Completeness` fails** | `MC_single_omission` |
+| `single_partial` | `SingleSource=true`, assigned lacks it | **`Completeness` fails** | `MC_single_partial` |
 | `no_live` | `EnableLive=false` + a `NewChunk` | **`Freshness` fails** | `MC_no_live` |
 
 This table belongs in `pkg/puller/internal/pullstate/pullstate_test.go`. A scaffold for it is at
 `pkg/puller/internal/pullstate/pullstate_scaffold_test.go` (build-tagged). **If a knob is off and
 the property does *not* break, the translation is wrong — that is the whole point of keeping the
-ablations.**
+ablations.** (`MC_nonatomic` is the one row that lives in the concurrent integration test, §8.2 /
+`TestOptimal_ConcurrentWantsDedupToOneFetch`, not here — the pure single-goroutine machine can't
+exhibit the TOCTOU.)
 
 ### 8.2 Integration scaffold (puller + pullsync over the mocks)
 

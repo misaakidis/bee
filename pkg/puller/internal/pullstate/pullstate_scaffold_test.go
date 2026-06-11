@@ -15,20 +15,29 @@
 // SAME outcomes as optimal-testbed/run.sh — knob for knob. If a knob is off and the
 // property does NOT break, the translation is wrong. That is the whole point of the matrix.
 //
-// INTENDED package API (implement in pullstate.go):
+// INTENDED package API (implement in pullstate.go). Identity is the (addr,batchID,stampHash)
+// triple — model `Chunk` == triple (brief §2); `c` below is a triple key.
 //
-//	type Config struct{ Dedup, Failover, Exclude, SingleSource, Priority, EnableLive bool }
+//	type Config struct{ Dedup, Failover, Exclude, ResetOnExhaust, SingleSource, Priority, EnableLive bool }
 //	func New(cfg Config, topo Topology) *Machine        // topo: holders[c], prio[c], assign[c]
-//	func (m *Machine) NewChunk(c swarm.Address)          // LIVE arrival -> arrived
+//	func (m *Machine) NewChunk(c Triple)                 // LIVE arrival -> arrived
 //	func (m *Machine) Enabled() []Op                     // enabled Want(c,p), the Next relation
-//	func (m *Machine) Want(c swarm.Address, p swarm.Address) bool   // fire Want if Claimable
-//	func (m *Machine) Deliver(c swarm.Address, p swarm.Address)     // honest delivery
-//	func (m *Machine) Stall(c swarm.Address, p swarm.Address)       // non-delivery -> failover
-//	func (m *Machine) Conflict() bool                    // the ConflictFree tripwire (must stay false)
-//	func (m *Machine) Deficit() int                      // |arrived \ got| (0 == Completeness)
-//	func (m *Machine) Got(c swarm.Address) bool
+//	func (m *Machine) Want(c Triple, p swarm.Address) bool   // fire Want if Claimable
+//	func (m *Machine) Deliver(c Triple, p swarm.Address)     // honest delivery (ndeliv++)
+//	func (m *Machine) Stall(c Triple, p swarm.Address)       // ANY non-delivery (Byz stall OR honest misfire)
+//	func (m *Machine) Lose(c Triple, p swarm.Address)        // churn: holder drops c (supply preserved)
+//	func (m *Machine) Gain(c Triple, p swarm.Address)        // churn: holder (re)acquires c
+//	// observers (the run.sh invariants/properties):
+//	func (m *Machine) Conflict() bool      // ConflictFree tripwire (must stay false)
+//	func (m *Machine) Ndeliv() int         // DeliveryFloor: must equal len(Got set)
+//	func (m *Machine) Deficit() int        // |arrived \ got| (0 == Completeness)
+//	func (m *Machine) SupplyOK() bool       // SupplyInv: every chunk still on >=1 honest holder
+//	func (m *Machine) Got(c Triple) bool
 //
-// All-on production config is Dedup=Failover=Exclude=EnableLive=Priority=true, SingleSource=false.
+// Stall folds the model's ByzStall AND SpuriousTimeout (the impl can't tell them apart — brief §4.3).
+// ResetExcluded fires internally when failed[c] covers every current holder (ResetOnExhaust).
+// All-on production config: Dedup=Failover=Exclude=ResetOnExhaust=EnableLive=Priority=true,
+// SingleSource=false.
 
 package pullstate_test
 
@@ -42,20 +51,24 @@ import (
 type matrixCase struct {
 	name string
 	// knob deltas from the all-on production config
-	dedup, failover, exclude, singleSource, priority, enableLive bool
-	omitter                                                      bool // one holder never delivers (-> Stall)
-	singleHolder                                                 bool // one chunk on exactly one holder (partial)
-	live                                                         bool // a chunk arrives post-cutoff (NewChunk)
+	dedup, failover, exclude, resetOnExhaust, singleSource, priority, enableLive bool
+	// scenario / located-idealisation budgets
+	omitter       bool // a Byzantine holder never delivers (-> Stall)
+	singleHolder  bool // one chunk on exactly one holder (partial / worst case)
+	live          bool // a chunk arrives post-cutoff (NewChunk)
+	timeoutBudget int  // spurious timeouts on honest peers (misfire)
+	churnBudget   int  // Lose/Gain events
+	peers         int  // tile size k (0 => 3)
 	// expectations
-	wantConflict bool // ConflictFree must break?  (nodedup, nonatomic)
-	wantStuck    bool // deficit must stay > 0?     (nofailover, noexclude, single_*)
+	wantConflict bool // ConflictFree must break?  (nodedup; nonatomic lives in §8.2)
+	wantStuck    bool // deficit must stay > 0?     (nofailover, noexclude, noreset, single_*)
 	wantUnfresh  bool // a LIVE chunk never delivered? (no_live)
 }
 
 // The matrix — same rows as optimal-testbed/run.sh (positives + ablations). Keep it in lockstep
 // with that file: if a row is added/changed there, change it here.
 func matrix() []matrixCase {
-	all := matrixCase{dedup: true, failover: true, exclude: true, singleSource: false, priority: true, enableLive: true}
+	all := matrixCase{dedup: true, failover: true, exclude: true, resetOnExhaust: true, singleSource: false, priority: true, enableLive: true}
 	with := func(name string, f func(*matrixCase)) matrixCase {
 		c := all
 		c.name = name
@@ -63,16 +76,34 @@ func matrix() []matrixCase {
 		return c
 	}
 	return []matrixCase{
-		// positives — invariant holds, deficit reaches zero
+		// positives — invariants hold, deficit reaches zero
 		with("base", func(c *matrixCase) {}),
 		with("partial", func(c *matrixCase) { c.singleHolder = true }),
 		with("omission", func(c *matrixCase) { c.omitter = true }),
 		with("vicinity", func(c *matrixCase) { c.priority = true }),
 		with("live", func(c *matrixCase) { c.live = true }),
+		// positives — relaxed assumptions (idealisations as knobs)
+		with("timeout", func(c *matrixCase) { c.singleHolder = true; c.timeoutBudget = 2 }),
+		with("churn", func(c *matrixCase) { c.omitter = true; c.churnBudget = 2 }),
+		with("storm", func(c *matrixCase) {
+			c.peers = 4
+			c.omitter = true
+			c.singleHolder = true
+			c.live = true
+			c.timeoutBudget = 1
+			c.churnBudget = 1
+		}),
+		with("scale", func(c *matrixCase) { c.peers = 6; c.omitter = true }), // two Byzantine in run.sh
 		// ablations — the named property must break
 		with("nodedup", func(c *matrixCase) { c.dedup = false; c.wantConflict = true }),
 		with("nofailover", func(c *matrixCase) { c.failover = false; c.omitter = true; c.wantStuck = true }),
 		with("noexclude", func(c *matrixCase) { c.exclude = false; c.omitter = true; c.wantStuck = true }),
+		with("noreset", func(c *matrixCase) {
+			c.resetOnExhaust = false
+			c.singleHolder = true
+			c.timeoutBudget = 1
+			c.wantStuck = true
+		}),
 		with("single_omission", func(c *matrixCase) { c.singleSource = true; c.omitter = true; c.wantStuck = true }),
 		with("single_partial", func(c *matrixCase) { c.singleSource = true; c.singleHolder = true; c.wantStuck = true }),
 		with("no_live", func(c *matrixCase) { c.enableLive = false; c.live = true; c.wantUnfresh = true }),
