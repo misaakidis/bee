@@ -25,6 +25,11 @@ This implements **Part I** of `pullsync-optimal-design.md` (§3–§10). Part II
 analysis, not code. The advertisement-bandwidth upgrade (§7, set reconciliation) is explicitly
 **out of scope and deferred** — we keep Offer/Want.
 
+**The scheduling logic is built as a state machine that is a 1:1 hand-translation of the verified
+TLA+ model `optimal-testbed/PullSyncerE.tla`** (§4) — same variables, actions, guards, and knobs —
+so the running protocol does what the model checker proved. The same knobs let the Go tests run the
+same ablation matrix as `optimal-testbed/run.sh` (§8.1).
+
 ---
 
 ## 1. Scope decisions (already made — do not relitigate)
@@ -163,83 +168,143 @@ Implementation notes:
 
 ---
 
-## 4. The per-chunk scheduler (`pkg/puller`)
+## 4. The per-chunk state machine — a 1:1 translation of `PullSyncerE.tla`
 
-Keep the master puller's **structural lesson** intact: a **single control goroutine** owns all
-scheduling state and never blocks on a network call. (This is also the lesson the legacy puller
-violated and the cause of the radius-decrease freeze.) Workers do the I/O off the control path
-and report back over a channel. The scheduler state — holder map, in-flight set, exclusions,
-per-peer load — is mutated **only** by that one goroutine, which makes the §5.2 atomic
-check-and-mark free.
+**This is the core ask of the PR: the scheduling logic is structured as a state machine that is a
+direct, line-traceable hand-translation of the verified TLA+ model, so the running protocol
+provably does what the model checker proved correct.** Same variables, same actions, same guards,
+same knobs. The model is the spec; the Go is the refinement.
 
-### 4.1 State (owned by the control goroutine, no locks)
+The TLA source lives in the SWIP repo at `optimal-testbed/PullSyncerE.tla` (per-chunk model) and
+`optimal-testbed/PullSyncerNA.tla` (the atomicity companion); `optimal-testbed/run.sh` is the
+config matrix (six positives, seven ablations). **Read those two `.tla` files before writing code
+— they are short (≈150 and ≈70 lines) and they ARE the design.** Mirror the swip-25d branch's
+craftsmanship here (a pure scheduler type with a TLA→Go mapping table in its doc comment) but
+translate `PullSyncerE`, not the bin-level `PullSyncer`.
 
-```text
-radius        uint8
-peers         set of connected eligible peers, with proximity(base,peer)
-perBin        for each bin >= radius:
-                offers   map[peerKey]offerState   // last offer from each peer (refs + topmost + per-peer start)
-                holders  map[address][]peerKey     // who offered each still-missing chunk
-inFlight      map[address]peerKey                  // §5.2 shared dedup set (the claim set)
-excluded      map[address]set[peerKey]             // §5.4 per-chunk failover log
-load          map[peerKey]int                      // §5.3 outstanding assigned fetches per peer
-intervals     persisted per (peer,bin) high-water  // statestore, as today
+### 4.1 The refinement principle (why this is sound)
+
+The model's `Next` is a non-deterministic choice among all enabled actions; TLC explores every
+choice and proves `ConflictFree` (safety) on all of them and `Completeness`/`Freshness` (liveness)
+under weak fairness. The implementation **resolves that non-determinism with a deterministic
+policy** — deepest-first ordering and least-loaded routing (§4.4) — but **every step the
+implementation takes is an enabled model action.** Because the implementation's behaviours are a
+*subset* of the model's, every safety property proven for the model holds for the implementation
+unchanged. The only thing a policy can break is *liveness* (by starving an enabled action forever),
+so the one obligation the refinement adds is **fairness**: every chunk that is `Claimable` from
+some honest holder must *eventually* get a `Want`. Keep the policy fair (finite bins, every missing
+chunk eventually routed) and `Completeness`/`Freshness` carry over too.
+
+> Practical consequence, and the headline test strategy (§8): because the Go state machine has the
+> **same knobs** as the model, the Go unit tests run the **same matrix as `run.sh`** — flip a knob
+> off and assert the same property breaks. "Runs as in the TLA models" stops being a slogan and
+> becomes a green test.
+
+### 4.2 The pure state machine (`pkg/puller/internal/pullstate`)
+
+A pure type — no I/O, no goroutines, no locks, **not safe for concurrent use** (one goroutine
+drives it, exactly like the swip-25d scheduler). Variables map 1:1 to `PullSyncerE`:
+
+| `PullSyncerE.tla` | `pullstate` (Go) | meaning |
+|---|---|---|
+| `got ⊆ Chunks` | `got map[addr]struct{}` (mirrors `ReserveHas`) | fetched + stored (terminal) |
+| `want ∈ [Chunks→SUBSET Peers]` | `want map[addr]peerKey` (Dedup ⇒ ≤1) | the in-flight **claim set** (§5.2) |
+| `failed ∈ [Chunks→SUBSET Peers]` | `excluded map[addr]set[peerKey]` | per-chunk failover log (§5.4) |
+| `arrived ⊆ Chunks` | `arrived map[addr]…` | available to fetch (HIST at init; LIVE via `NewChunk`) |
+| `conflict ∈ BOOLEAN` | `conflict bool` | **must stay false**; latched on any double-deliver — a bug detector |
+| `Holds[p]` (fixed) | `holders map[addr]set[peerKey]` (built from Offers) | who holds/offered each chunk |
+| `Prio[c]` | bin number (deeper = higher) | priority key for `PrioOK` |
+
+Plus the per-peer routing state the model abstracts away: `load map[peerKey]int` (outstanding
+assigned fetches, for §4.4 least-loaded). And, as today, the persisted per-`(peer,bin)`
+`intervalstore.Intervals` high-water (HIST resume; keep `IntervalPrefix="sync_interval"`, no
+migration).
+
+The knobs are a `Config` mirroring the `CONSTANT`s — **production defaults in bold**, the others
+exist so the tests can ablate:
+
+```go
+type Config struct {
+    Dedup        bool // §5.2  — true
+    Failover     bool // §5.4  — true
+    Exclude      bool // §5.4  — true
+    SingleSource bool // §5.1  — false (true is a *disqualified* ablation; never ship true)
+    Priority     bool // §5.5  — true (deepest-first; correctness-neutral, so optional but on)
+    EnableLive   bool // §5.6  — true
+}
 ```
 
-- **HIST vs LIVE** is, as today, the cursor boundary: BinIDs ≤ the peer's cursor-at-start are
-  HIST, above are LIVE. Reuse `intervalstore.Intervals` and the `sync_interval_%03d_%s`
-  statestore keys (`peerIntervalKey`) **unchanged** — the on-disk format must stay compatible
-  (no migration). Keep `IntervalPrefix = "sync_interval"`.
+### 4.3 The actions (translate verbatim — same guards)
 
-### 4.2 Control loop (mirror master's `manage`)
+Each TLA action becomes one method; each conjunct becomes one guard. Do not paraphrase the guards —
+copy them.
 
-Events: topology change (`SubscribeTopologyChange`), radius poll/change, worker result, and a
-periodic scheduling tick. On each event, update state and (re)compute assignments, then spawn/cancel
-workers. Never call `Offer`/`Fetch`/`GetCursors` on the control goroutine — push them to workers.
+| `PullSyncerE` action | `pullstate` method | the guard (`Claimable` etc.) |
+|---|---|---|
+| `Want(c,p)` | `Want(addr, peer) (ok bool)` | `Claimable`: `c∈arrived ∧ c∈Holds[p] ∧ c∉got ∧ p∉want[c] ∧ p∉failed[c] ∧ (Dedup⇒want[c]={}) ∧ (SingleSource⇒p=Assign[c]) ∧ (c∈Live⇒EnableLive) ∧ PrioOK(c)` |
+| `Deliver(c,p)` | `Deliver(addr, peer)` | `p∈Honest ∧ p∈want[c]`; sets `got∪={c}`, **latches `conflict` if `c∈got` already**, clears `want[c]` |
+| `ByzStall(c,p)` | `Stall(addr, peer)` | `p∈want[c] ∧ Failover`; clears `want[c]`, and **if `Exclude`** adds `p` to `failed[c]` |
+| `NewChunk(c)` | `NewChunk(addr)` | `c∈LiveChunks ∧ c∉arrived`; `arrived∪={c}` |
+| `PrioOK(c)` | `prioOK(addr) bool` | `¬Priority ∨ ∀d∈arrived: Prio[d]>Prio[c] ⇒ Addressed(d)` (deepest-first) |
 
-### 4.3 The per-chunk algorithm (§5.6 — this is the heart of the PR)
+Translation notes that matter:
+- **`Deliver`'s `conflict` latch is your runtime double-fetch detector.** In the model it's how the
+  ablation fails; in production it must never fire — wire it to a metric/`logger.Error` and treat a
+  trip as a bug. This is the `ConflictFree` invariant made observable.
+- **"Byzantine" / "Honest" are not knowable at runtime.** The model labels a non-delivering peer
+  Byzantine; the implementation just observes *a `Fetch` that didn't deliver `c`* and calls
+  `Stall`. Any non-delivery (omission, timeout, error, peer gone) maps to `ByzStall`. An honest
+  delivery maps to `Deliver`. You never classify peers — you react to outcomes.
+- **`SingleSource` stays false in production.** It is the disqualified family (`MC_single_*`). Keep
+  it only as a test knob to reproduce the disqualification.
+- The state machine exposes a **`Step()`** (or `Claimable`-enumerator) that returns the set of
+  enabled `Want`s as `Op`s for the I/O shell — mirror the swip-25d `Op`/`activateNext` shape
+  (`OpStart`/`OpStop`/`OpLive` → here `OpFetch`/`OpStop`/`OpLive`). The shell never reaches into
+  the state directly.
 
-For a neighbourhood, per scheduling round:
+### 4.4 Resolving the model's non-determinism: routing & order as policy
 
-1. **Discovery.** For each eligible peer `p` (proximity ≥ bin, bin ≥ radius), a worker calls
-   `Offer(p, bin, start_p)` where `start_p` is `p`'s persisted high-water for that bin. Record
-   `offers[p]` and, for each offered ref whose triple is **not** locally held
-   (`ReserveHas==false`), add `p` to `holders[addr]`.
-   - `start_p` is **per-peer** because BinIDs are assigned independently by each peer (a chunk is
-     BinID 5 at one peer, 9 at another). Dedup by **address** is still global and correct; only
-     the resume bookkeeping is per-peer. **This is the subtle invariant — see §4.4.**
-2. **Schedule, deepest bins first.** Iterate bins high→low. For each still-missing chunk `c` in a
-   bin (any order within the bin):
-   - if `c`'s address `∈ inFlight`: **skip** (already claimed).
-   - `cands = holders[c] \ excluded[c]`; if empty: leave for a later round (supply may appear, or
-     the chunk is unfetchable — an availability failure outside pull's remit, §6.1).
-   - choose `p* = argmin load[p]` over `cands`, ties broken by highest proximity (`swarm.Proximity`).
-     The XOR/`swarm.DistanceCmp` tiebreak balances load network-wide (it splits a tie to different
-     peers for different pivots — see §5.3 / the `swip-25d` `assign` for the idiom, but note that
-     code routes *whole bins*, here you route *one chunk*).
-   - **atomically** set `inFlight[addr] = p*`, `load[p*]++`, and enqueue `c` onto `p*`'s want set.
-3. **Fetch.** For each peer with a non-empty want set, a worker calls `Fetch(p, bin, start_p,
-   want)`. On the result, the worker reports back; the control goroutine:
-   - **delivered** chunk `c`: clear `inFlight[addr]`, `load[p]--`, drop `c` from `holders`.
-   - **stall / under-delivery / error** for `c`: clear `inFlight[addr]`, `load[p]--`, add `p` to
-     `excluded[c]` (§5.4 — **permanent for that chunk**, so the staller cannot re-grab it), and
-     re-schedule `c` in the next round (it will pick another holder). Bound stalls per chunk to
-     `≤ k`.
-4. **Advance intervals.** See §4.4.
-5. **LIVE.** Once a bin's HIST is drained for a peer (its interval reaches the start-cursor), keep
-   a live subscription open: each newly-arrived chunk enters the same per-chunk loop (one round).
-   A node that only drains HIST never converges on post-cursor arrivals — freshness fails (doc
-   §5.6 / `MC_no_live` ablation).
+`Step()` may return several enabled `Want(c,p)` (chunk `c` offered by several holders; several
+chunks claimable). The model picks arbitrarily; the implementation picks deterministically:
+- **Which chunk first:** deepest bin first — already enforced as the `PrioOK` *guard* (so it is part
+  of the verified model: `MC_vicinity` shows it correctness-neutral). Within a bin, any order.
+- **Which holder:** `p* = argmin load[p]` over `holders[c] \ excluded[c]` (§5.3), ties broken by
+  proximity via `swarm.Proximity` / `swarm.DistanceCmp` (latency + network-wide balance). This is
+  *not* in the model — it only chooses *among already-enabled* `Want`s, so it cannot violate safety;
+  keep it fair so it cannot starve liveness.
 
-`pullsync.Fetch` returns an aggregate count, not per-chunk outcomes. The cleanest way to get
-per-chunk failover is to **fetch one peer's assigned subset and treat a `Fetch` error as a stall
-for that whole subset** (exclude `p` for each `c` in the subset, reschedule them). That preserves
-the gate-critical guarantee (each `c` retried on another holder) without per-chunk wire feedback.
-If you want finer granularity, have `Fetch` return which refs it actually delivered — that is a
-legitimate Go-API addition (still no wire change, since deliveries already carry their address).
-**Document whichever you choose and cover it in tests.**
+When `Want(c,p*)` is accepted, the in-flight mark is set **inside the same method call** (the
+`Dedup⇒want[c]={}` check and the `want[c]∪={p}` update are one step — §4.7). `load[p*]++`. The shell
+then issues `OpFetch`.
 
-### 4.4 The interval-advance invariant (correctness-critical — get this right)
+### 4.5 The I/O shell drives the state machine (`pkg/puller/puller.go`)
+
+Keep master's structural lesson: a **single control goroutine** owns the `pullstate` machine and the
+worker set, and **never blocks on a network call**. (This is also why the legacy puller froze on a
+radius decrease — a lock held across blocking I/O.) The shell is the bridge between the model's
+abstract actions and the wire:
+
+| shell event | becomes | state-machine call |
+|---|---|---|
+| peer connects / `Offer` returns | learn holdings; HIST chunks available | populate `holders`/`arrived`; `Step()` |
+| `Offer` returns a post-cursor chunk | LIVE arrival | `NewChunk(addr)` then `Step()` |
+| `OpFetch` → `pullsync.Fetch` succeeds for `c` | honest delivery | `Deliver(addr, peer)` |
+| `Fetch` fails / times out / peer gone for `c` | non-delivery | `Stall(addr, peer)` |
+| topology / radius change | re-tile | update radius; re-`Step()` (§4.7) |
+
+`pullsync.Fetch` returns an aggregate count, not per-chunk outcomes. The clean mapping: **fetch one
+peer's assigned subset; a `Fetch` error is a `Stall` for every `c` in that subset** (each then
+re-routes to another holder next `Step()`), and the chunks it did deliver are `Deliver`ed (match by
+address — deliveries carry their address). If you want crisper feedback, have `Fetch` return the
+addresses it delivered (a Go-API addition, no wire change). **Pick one, document it, test it.**
+
+Discovery detail: for each eligible peer `p` (proximity ≥ bin, bin ≥ radius) a worker calls
+`Offer(p, bin, start_p)` with `p`'s persisted high-water `start_p`. `start_p` is **per-peer**
+because BinIDs are assigned independently by each peer (a chunk is BinID 5 at one peer, 9 at
+another). Dedup keys on **address** (global, correct); only the resume bookkeeping is per-peer —
+see the interval invariant in §4.6.
+
+### 4.6 The interval-advance invariant (correctness-critical — get this right)
 
 A `(peer, bin)` interval records "I have synced everything peer `p` offered in this bin up to BinID
 `X`." With cross-peer dedup, a chunk peer `A` offered may have been fetched from peer `B`. That is
@@ -253,14 +318,30 @@ still-missing chunk — that would silently drop it and break O1 (Completeness).
 > bookkeeping. The master puller sidesteps it (each peer fetches everything it offers). Write a
 > dedicated test (§8, `TestIntervalAdvanceAfterCrossPeerFetch`).
 
-### 4.5 Radius changes (keep master's behaviour)
+### 4.7 Radius changes (keep master's behaviour)
 
 - **Decrease** (bins re-enter the reserve): reset the affected bins' intervals so evicted/ignored
   chunks resync (master's `resetIntervals`). Re-tile per §4 of the doc.
 - **Increase**: stop syncing bins that left the reserve.
 - Reuse `storer.RadiusChecker.StorageRadius()`; react on topology change and a poll tick, as today.
 
-### 4.6 Misbehaviour / blocklist
+### 4.8 The atomicity obligation (`PullSyncerNA` — the one thing the model demands of the code)
+
+`PullSyncerNA.tla` isolates the single refinement obligation the design places on the
+implementation: the in-flight **check-and-mark must be one critical section**. The model's `Want`
+fuses the dedup check (`want[c]={}`) and the mark (`want[c]∪={p}`) into one indivisible step;
+`PullSyncerNA` splits them into `Decide` (check) and `Commit` (mark) behind an `Atomic` knob and
+shows `ConflictFree` breaks when `Atomic=FALSE` (two peers both pass the check on `want[c]={}`,
+both mark, the chunk is delivered twice — TOCTOU).
+
+In this design the obligation is discharged **structurally**: the `pullstate` machine is mutated by
+exactly one goroutine (§4.5), so `Want`'s check-and-mark is atomic by construction. **Do not add a
+second mutator of the claim set, and do not split the check from the mark across an `await`/channel
+hop.** The `-race` test `TestOptimal_ConcurrentWantsDedupToOneFetch` (§8) is the guard. If you ever
+must let multiple goroutines claim, the claim set needs a mutex held across check-and-mark — but the
+single-goroutine design is simpler and is what the model assumes.
+
+### 4.9 Misbehaviour / blocklist
 
 Keep it simple and faithful to the doc. The gate-critical mechanism is **exclude-per-chunk**
 (§5.4). A peer that stalls across many chunks is a candidate for the p2p blocklist
@@ -279,11 +360,12 @@ a tunable in `Options` (default off or generous). Don't let it gold-plate the PR
 | `pkg/pullsync/mock/pullsync.go` | Implement `Offer`/`Fetch`; keep `Option` pattern + interface check. |
 | `pkg/pullsync/pullsync_test.go` | Rework the `Sync`-based tests to `Offer`/`Fetch`; keep `synctest`+`streamtest`+`mock.NewReserve` style. |
 | `pkg/pullsync/metrics.go` | Keep counters; rename/add as the new flow needs (e.g. split offered vs fetched). |
-| `pkg/puller/puller.go` | Replace per-peer sessions with the single-goroutine per-chunk scheduler (§4). |
-| `pkg/puller/metrics.go` | Add: deliveries (should ≈ missing-chunk count), dedup-suppressed wants, failovers/exclusions, per-peer load skew. These metrics *are* the O3/O5 evidence. |
-| `pkg/puller/export_test.go` | Export the test seams you need (e.g. a way to inspect in-flight/holders/load, set the tick interval). Mirror the existing `PeerIntervalKey` export idiom. |
-| `pkg/puller/puller_test.go` | New tests per §8. |
-| (maybe) `pkg/puller/internal/...` | If the scheduler grows, factor a pure, lock-free scheduler type into `internal/` and unit-test it in isolation (the `swip-25d` branch did this and it paid off — see §9). The scheduler being pure (no I/O) is what makes it exhaustively testable. |
+| **`pkg/puller/internal/pullstate/pullstate.go`** (new) | The pure state machine — the 1:1 translation of `PullSyncerE.tla` (§4.2–§4.4): variables, `Config` knobs, `Want`/`Deliver`/`Stall`/`NewChunk`, `Claimable`/`prioOK`, `Step()`→`Op`s. No I/O, no goroutines, no locks. Put the TLA→Go mapping table in the package doc comment. |
+| `pkg/puller/internal/pullstate/pullstate_test.go` (new) | Unit-test the state machine **against the same matrix as `optimal-testbed/run.sh`** (the ablation parity table, §8). |
+| `pkg/puller/puller.go` | Replace per-peer sessions with the single-goroutine I/O shell that drives `pullstate` (§4.5). |
+| `pkg/puller/metrics.go` | Add: deliveries (should ≈ missing-chunk count), dedup-suppressed wants, failovers/exclusions, per-peer load skew, and a **`conflict`** counter (must stay 0 — the `ConflictFree` tripwire, §4.3). These metrics *are* the O3/O5 evidence. |
+| `pkg/puller/export_test.go` | Export the test seams you need (inspect in-flight/holders/load, set the tick interval). Mirror the existing `PeerIntervalKey` export idiom. |
+| `pkg/puller/puller_test.go` | New integration tests per §8. |
 | `pkg/node/node.go` | Only if the `puller.New`/`pullsync.New` signatures change. Keep them identical if you can (the call sites are `node.go:1064` and `node.go:1155`). |
 
 **Do not touch:** `pkg/pullsync/pb/*`, `pkg/storer/*`, `pkg/topology/*`, anything postage.
@@ -355,20 +437,53 @@ Non-functional: no wire/`.proto` change; statestore interval format unchanged (n
 
 ---
 
-## 8. Failing test scaffold
+## 8. Test strategy & failing scaffold
 
-The scaffold lives in:
+Two layers. The first is the one that makes "runs as in the TLA models" concrete.
+
+### 8.1 State-machine parity with the TLA matrix (the primary correctness evidence)
+
+Unit-test the pure `pullstate` machine (§4.2) against **the same config matrix as
+`optimal-testbed/run.sh`** — same knobs, same expected outcomes. This is the Go analogue of the
+model checker: drive the machine through interleavings, assert the invariant
+(`conflict==false`) holds (positives) or breaks (ablations), and that the deficit reaches zero
+(`Completeness`) or doesn't (the failover/single-source ablations), and that LIVE arrivals are
+delivered (`Freshness`) or aren't (`MC_no_live`). Because the machine is pure and tiny, the test
+can either enumerate interleavings exhaustively for `k=2,3` (a hand-rolled BFS over enabled
+actions — the closest thing to TLC in Go) or drive randomized schedules with a seed.
+
+| Go test case | knob delta from all-on | expect | mirrors |
+|---|---|---|---|
+| `base` | — (full repl, honest) | `conflict==false`, deficit→0 | `MC_base` |
+| `partial` | one chunk on a single holder | same | `MC_partial` |
+| `omission` | one holder never delivers (→`Stall`) | same (repaired by failover) | `MC_omission` |
+| `vicinity` | `Priority=true` | same (order is correctness-neutral) | `MC_vicinity` |
+| `live` | a `NewChunk` after init | same + `Freshness` | `MC_live` |
+| `nodedup` | `Dedup=false` | **`conflict` latches** | `MC_nodedup` |
+| `nofailover` | `Failover=false` + omitter | **deficit stuck >0** | `MC_nofailover` |
+| `noexclude` | `Exclude=false` + omitter | **deficit stuck >0** (re-grab livelock) | `MC_noexclude` |
+| `single_omission` | `SingleSource=true`, assigned=omitter | **deficit stuck >0** | `MC_single_omission` |
+| `single_partial` | `SingleSource=true`, assigned lacks it | **deficit stuck >0** | `MC_single_partial` |
+| `no_live` | `EnableLive=false` + a `NewChunk` | **`Freshness` fails** | `MC_no_live` |
+
+This table belongs in `pkg/puller/internal/pullstate/pullstate_test.go`. A scaffold for it is at
+`pkg/puller/internal/pullstate/pullstate_scaffold_test.go` (build-tagged). **If a knob is off and
+the property does *not* break, the translation is wrong — that is the whole point of keeping the
+ablations.**
+
+### 8.2 Integration scaffold (puller + pullsync over the mocks)
+
+The build-tagged scaffolds:
 - `pkg/puller/optimal_scaffold_test.go`
 - `pkg/pullsync/optimal_scaffold_test.go`
 
-Both are guarded by the build tag `//go:build pullsync_optimal_scaffold` so the **master build
-stays green** while the API they reference does not yet exist. As you implement, flip them on
-(`go test -tags pullsync_optimal_scaffold ./pkg/puller/...`) and, once the new API is the real
-one, delete the tag so they run by default. Each test maps to a numbered acceptance criterion in
-§7 and is written against the **intended** `Offer`/`Fetch` API and the existing mock infra
-(`kadMock`, `mockps`, `resMock`, `leveldb` statestore, `spinlock`, `synctest`, `streamtest`). They
-are deliberately skeletal — fill the assertions as the behaviour solidifies, but the table cases
-and the scenario names are the spec. **Do not weaken a test to make it pass; fix the code.**
+All scaffolds are guarded by `//go:build pullsync_optimal_scaffold` so the **master build stays
+green** while the API they reference does not yet exist. As you implement, flip them on
+(`go test -tags pullsync_optimal_scaffold ./pkg/puller/...`) and, once the new API is the real one,
+delete the tag so they run by default. Each test maps to a numbered acceptance criterion in §7 and
+uses the existing infra (`kadMock`, `mockps`, `resMock`, `leveldb` statestore, `spinlock`,
+`synctest`, `streamtest`). They are deliberately skeletal — the scenario names and table cases are
+the spec. **Do not weaken a test to make it pass; fix the code.**
 
 ---
 
