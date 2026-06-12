@@ -339,6 +339,7 @@ abstract actions and the wire:
 | `Fetch` did **not** deliver `c` (error/timeout/short/gone) | non-delivery | `Stall(c, p)` |
 | a re-`Offer` shows `p` no longer holds a claimed `c` | churn (`Lose`) | release the claim (`Stall(c,p)` semantics, no bar); `Step()` |
 | `holders[c] \ excluded[c] = ∅` while `c` missing **and `want[c] = ∅`** (never clear bars under a live claim — the model's `want[c] = {}` conjunct) | exhausted | `resetExcluded(c)` then `Step()` |
+| poll tick (floored) | same-range refresh: re-`Offer` covered-but-unsettled ranges — the churn-detecting offer-diff. Rounds themselves only extend coverage (see *Offer pacing* below) | rebuild `holders`; `Step()` |
 | topology / radius change | re-tile | update radius; re-`Step()` (§4.7) |
 
 **Failover is per-chunk (follow the model).** The model's `Stall` is per-`(c,p)`, so `pullsync.Fetch`
@@ -362,6 +363,29 @@ bug — log it, don't spin.
 (§4.3), the shell must clear a chunk's bars once they cover *every current holder* — otherwise the
 chunk is stuck (the `MC_noreset` failure). Realize it as a cooldown / fresh-retry round, re-checked
 after each `Offer` rebuild (holders can also reappear via churn).
+
+**Offer pacing: rounds only EXTEND coverage** *(a deterministic-harness find — the melissi sans-io
+core busy-looped on this before any network existed)*. Open a fresh `Offer(p, bin, start)` as the
+immediate consequence of a round completing **only when `start` is past the last covered
+`Topmost`** — the uncovered tail, where the server blocks on an empty range (`pageTimeout`).
+Never eagerly re-offer covered ground: a gap (chunks unsettled because holders are barred or a
+retry is pending) does **not** need a fresh advert — retries route through already-known holders —
+and an empty or instantly-answered offer costs the rate limiter nothing (`max(1, 0)` tokens: the
+design doc's §6.2 *empty-offer respawn*, here self-inflicted), so the loop spins on advertisement
+as pure CPU/connection churn that wall-clock latency merely dilutes. Same-range refresh — the
+churn-detecting offer-diff of §4.5's table — runs only on the poll tick, with an explicit floor.
+Pin it with a test: a drained or gapped bin produces no new `Offer` until the tick fires.
+
+The rule has its own spec — `optimal-testbed/OfferPacing.tla`: `AdvertBound` (offers ≤
+justifications — the advertisement analogue of `DeliveryFloor`), with `MC_respawn` as the eager
+ablation and `MC_pacing_griefed` machine-checking that instantly-empty answers cannot extort
+adverts beyond the tick floor. Implementation consequences: (a) track the **covered `Topmost`
+per `(peer, bin)`** as soft state beside the persisted interval — the emit guard is
+`Next() > covered`, which the interval alone cannot express (a gap keeps `Next() ≤ covered`);
+(b) on every offer response set `covered = max(covered, Topmost, start)` — an answer covers at
+least what it was asked for, or a hostile under-stated `Topmost` re-justifies the round;
+(c) export `offers_emitted` and `offer_justifications` as a metric pair — the respawn tripwire,
+alongside the `conflict` counter.
 
 Discovery detail: for each eligible peer `p` (proximity ≥ bin, bin ≥ radius) a worker calls
 `Offer(p, bin, start_p)` with `p`'s persisted high-water `start_p`. `start_p` is **per-peer**
