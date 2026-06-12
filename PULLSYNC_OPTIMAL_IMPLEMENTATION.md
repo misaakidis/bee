@@ -4,8 +4,11 @@
 > work, not part of the shipped product — **delete it before the PR is opened for review.**
 >
 > **Source of truth for the design:** `pullsync-optimal-design.md` (the SWIP doc). Section
-> references below (§5.1 etc.) point into it. When this brief and the doc disagree, the doc
-> wins — flag the discrepancy rather than guessing.
+> references below (§5.1 etc.) point into it. **Source of truth for the implementation
+> philosophy:** `pullsync-optimal-implementation.md` (same repo) — the durable companion this
+> brief is the task-scaffold for: the refinement stance, the component ↔ property ↔
+> counterexample table, the structural rules, interval settlement, the build order. When this brief and
+> either doc disagree, the doc wins — flag the discrepancy rather than guessing.
 
 ---
 
@@ -56,7 +59,7 @@ loses an optimality bound). Plus the LIVE obligation (§5.6).
 | # | Doc | Mechanism | Where it lives in this PR | Tier |
 |---|---|---|---|---|
 | 1 | §5.1 | **Multi-source ≥2**: each missing chunk has ≥2 candidate holders; one fetch at a time, the rest are fallbacks | scheduler: `holders[chunk] = set of peers that offered it` | gate-critical (O1, O6) |
-| 2 | §5.2 | **Chunk-level dedup**: one shared, **triple-keyed** in-flight set; check-and-mark is **one indivisible step** | scheduler: `inFlight map[triple]peer`, consulted+set atomically before issuing a `Want` | gate-critical (O3) |
+| 2 | §5.2 | **Chunk-level dedup**: one shared, **triple-keyed** in-flight set; check-and-mark is **one indivisible step** | scheduler: `want map[triple]set[peerKey]`, consulted+set atomically before issuing a `Want` (`DedupInv` keeps it ≤1 in production — see §4.2 for why the type is a set) | gate-critical (O3) |
 | 3 | §5.4 | **Failover-with-exclude-and-reset**: on stall try the next holder and **bar** the staller *for that chunk*; **clear a chunk's bars once they cover every current holder** (`ResetOnExhaust`) | scheduler: `excluded[triple] = barred peers`; reset when `holders\excluded = ∅` | gate-critical (O1, O6) |
 | 4 | §5.3 | **Load-aware routing**: among a chunk's holders, fetch from the **least-loaded**; ties broken by proximity (latency) | scheduler: per-peer outstanding-fetch counter; pick `argmin load` over `holders[c] \ excluded[c]` | floor-achieving (O5) |
 | 5 | §5.5 | **Deepest-first**: fetch the deepest (highest-PO, nearest) bins first | scheduler: iterate bins high→low | floor-achieving (O2) |
@@ -109,8 +112,9 @@ memory keyed to that stream. So you cannot offer on stream A and want on stream 
 **Recommended approach (clean, mockable): re-offer on fetch.**
 
 - `Offer(ctx, peer, bin, start)` opens a stream, sends `Get`, reads the `Offer`, then closes the
-  stream (send an empty `Want` so the server returns cleanly, or `Reset` — match whatever the
-  handler tolerates without logging errors; verify against `handler`). Returns the offered chunk
+  stream by sending an **empty `Want`** (verified against `handler`: it flows through `processWant`
+  with zero chunks and `FullClose`s cleanly, costing one rate-limiter token — whereas a client
+  `Reset` makes the server's `read want` error and get logged). Returns the offered chunk
   descriptors + `Topmost`.
 - `Fetch(ctx, peer, bin, start, want []ChunkRef)` opens a **fresh** stream, runs the full
   `Get→Offer→Want→Delivery` cycle but sets the `Want` bits only for the `want` subset (matched
@@ -177,8 +181,8 @@ same knobs. The model is the spec; the Go is the refinement.
 
 The TLA source lives in the SWIP repo at `optimal-testbed/PullSyncerE.tla` (per-chunk model) and
 `optimal-testbed/PullSyncerNA.tla` (the atomicity companion); `optimal-testbed/run.sh` is the
-config matrix (six positives, seven ablations). **Read those two `.tla` files before writing code
-— they are short (≈150 and ≈70 lines) and they ARE the design.** Mirror the swip-25d branch's
+config matrix (ten positives, eight ablations). **Read those two `.tla` files before writing code
+— they are short (≈240 and ≈100 lines) and they ARE the design.** Mirror the swip-25d branch's
 craftsmanship here (a pure scheduler type with a TLA→Go mapping table in its doc comment) but
 translate `PullSyncerE`, not the bin-level `PullSyncer`.
 
@@ -208,8 +212,8 @@ map 1:1 to `PullSyncerE`:
 
 | `PullSyncerE.tla` | `pullstate` (Go) | meaning |
 |---|---|---|
-| `got ⊆ Chunks` | `got map[triple]struct{}` (mirrors `ReserveHas`) | fetched + stored (terminal) |
-| `want ∈ [Chunks→SUBSET Peers]` | `want map[triple]peerKey` (Dedup ⇒ ≤1) | the in-flight **claim set** (§5.2) |
+| `got ⊆ Chunks` | a `ReserveHas`-backed *view* + small recent-deliveries cache (see working-set note below) | fetched + stored (terminal) |
+| `want ∈ [Chunks→SUBSET Peers]` | `want map[triple]set[peerKey]` | the in-flight **claim set** (§5.2). A *set*, as in the model: `DedupInv` (≤1 entry while `Dedup` is on) is a **checked invariant, not baked into the type** — a `map[triple]peerKey` could not represent the `nodedup` ablation (§8.1), which needs concurrent claims per chunk to exhibit the double-fetch |
 | `failed ∈ [Chunks→SUBSET Peers]` | `excluded map[triple]set[peerKey]` | per-chunk failover log (§5.4) |
 | `arrived ⊆ Chunks` | `arrived map[triple]…` | available to fetch (HIST at init; LIVE via `NewChunk`) |
 | `conflict ∈ BOOLEAN` | `conflict bool` | **must stay false**; latched on any double-deliver — a bug detector |
@@ -225,6 +229,16 @@ Plus the per-peer routing state the model abstracts away: `load map[peerKey]int`
 assigned fetches, for §4.4 least-loaded). And, as today, the persisted per-`(peer,bin)`
 `intervalstore.Intervals` high-water (HIST resume; keep `IntervalPrefix="sync_interval"`, no
 migration).
+
+**Bound the working set — the model has no memory dimension; you do.** Do **not** literally
+materialise `got`/`arrived`/`holders` over the whole backlog: on a cold start `g ≈ M` — millions
+of triples × `k` holder entries — and the literal maps are hundreds of MB. The machine's maps hold
+only the **open window** per `(peer, bin)`: offers already arrive in pages (`DefaultMaxPage = 250`),
+and the persisted interval is the resume point, so a triple enters the maps when an offer names it
+and is dropped once every interval that covers it has advanced past it (§4.6). `got` is a
+`ReserveHas`-backed view plus a small cache of this session's deliveries — never a full mirror of
+the reserve. The invariants (`DedupInv`, `ClaimsLive`, `DeliveryFloor`) are over the window, which
+is exactly the model's `Chunks` instantiated per round.
 
 The knobs are a `Config` mirroring the `CONSTANT`s — **production values in the comment**, the
 others exist so the tests can ablate:
@@ -259,7 +273,7 @@ copy them.
 | `ResetExcluded(c)` | `resetExcluded(c)` | `ResetOnExhaust ∧ c∈arrived ∧ c∉got ∧ want[c]={} ∧ failed[c]≠{} ∧ (∀p: c∈holds[p] ⇒ p∈failed[c])`; clears `failed[c]` |
 | `Lose(c,p)` / `Gain(c,p)` | (no method) — holdings update via re-Offer | churn is *observed* (a later Offer differs), not an action you call; releases the claim if a held-claim is lost. See §4.5 |
 | `NewChunk(c)` | `NewChunk(c)` | `c∈LiveChunks ∧ c∉arrived`; `arrived∪={c}` |
-| `PrioOK(c)` | `prioOK(c) bool` | `¬Priority ∨ ∀d∈arrived: Prio[d]>Prio[c] ⇒ Addressed(d)` (deepest-first) |
+| `PrioOK(c)` | `prioOK(c) bool` | `¬Priority ∨ ∀d∈arrived: (Prio[d]>Prio[c] ∧ d has ≥1 eligible holder) ⇒ Addressed(d)` (deepest-first; **deliberately weakened vs the model** — see note below) |
 
 Translation notes that matter:
 - **`Deliver`'s `conflict` latch is your runtime double-fetch detector.** In the model it's how the
@@ -275,6 +289,16 @@ Translation notes that matter:
   proves permanent bars + one misfire = lost chunk). `NoFalseExclusion` is the *idealised*
   `TimeoutBudget=0` corner (perfect attribution); the real puller lives at `TimeoutBudget>0`, so
   build for misfires.
+- **`prioOK` ranges only over chunks with ≥1 eligible holder (`holders[d] \ excluded[d] ≠ ∅`) —
+  a deliberate, flagged deviation from the model.** The model's `PrioOK` quantifies over all
+  arrived chunks; that is safe *there* because supply is an `ASSUME` and weak fairness guarantees
+  the deepest chunk is eventually addressed. The implementation lives outside that assumption —
+  §4.5 itself says a chunk with no holders is an availability failure to log, not spin on. With
+  the verbatim guard, that one unfetchable deep chunk would be permanently unaddressed and would
+  **head-of-line block every shallower bin forever**, escalating a push-sync availability failure
+  into a node-wide sync stall. Restricting the quantifier to claimable chunks removes the hazard
+  and forfeits nothing verified: `MC_vicinity` proves Priority correctness-neutral, so any
+  weakening of the ordering guard is safe by construction.
 - **`SingleSource` stays false in production.** It is the disqualified family (`MC_single_*`). Keep
   it only as a test knob to reproduce the disqualification.
 - The state machine exposes a **`Step()`** (or `Claimable`-enumerator) that returns the set of
@@ -286,16 +310,19 @@ Translation notes that matter:
 
 `Step()` may return several enabled `Want(c,p)` (chunk `c` offered by several holders; several
 chunks claimable). The model picks arbitrarily; the implementation picks deterministically:
-- **Which chunk first:** deepest bin first — already enforced as the `PrioOK` *guard* (so it is part
-  of the verified model: `MC_vicinity` shows it correctness-neutral). Within a bin, any order.
+- **Which chunk first:** deepest bin first — already enforced as the `prioOK` *guard*, restricted
+  to claimable chunks (§4.3 note; `MC_vicinity` shows ordering correctness-neutral). Within a bin,
+  any order.
 - **Which holder:** `p* = argmin load[p]` over `holders[c] \ excluded[c]` (§5.3), ties broken by
   proximity via `swarm.Proximity` / `swarm.DistanceCmp` (latency + network-wide balance). This is
   *not* in the model — it only chooses *among already-enabled* `Want`s, so it cannot violate safety;
   keep it fair so it cannot starve liveness.
 
 When `Want(c,p*)` is accepted, the in-flight mark is set **inside the same method call** (the
-`Dedup⇒want[c]={}` check and the `want[c]∪={p}` update are one step — §4.7). `load[p*]++`. The shell
-then issues `OpFetch`.
+`Dedup⇒want[c]={}` check and the `want[c]∪={p}` update are one step — §4.7). `load[p*]++`; the
+matching `Deliver(c,p*)` or `Stall(c,p*)` does `load[p*]--` — every assignment returns exactly
+once, so `load[p]` is always the count of `p`'s outstanding claims. The shell then issues
+`OpFetch`.
 
 ### 4.5 The I/O shell drives the state machine (`pkg/puller/puller.go`)
 
@@ -311,7 +338,7 @@ abstract actions and the wire:
 | `Fetch` delivered `c` from `p` | honest delivery | `Deliver(c, p)` |
 | `Fetch` did **not** deliver `c` (error/timeout/short/gone) | non-delivery | `Stall(c, p)` |
 | a re-`Offer` shows `p` no longer holds a claimed `c` | churn (`Lose`) | release the claim (`Stall(c,p)` semantics, no bar); `Step()` |
-| `holders[c] \ excluded[c] = ∅` while `c` missing | exhausted | `resetExcluded(c)` then `Step()` |
+| `holders[c] \ excluded[c] = ∅` while `c` missing **and `want[c] = ∅`** (never clear bars under a live claim — the model's `want[c] = {}` conjunct) | exhausted | `resetExcluded(c)` then `Step()` |
 | topology / radius change | re-tile | update radius; re-`Step()` (§4.7) |
 
 **Failover is per-chunk (follow the model).** The model's `Stall` is per-`(c,p)`, so `pullsync.Fetch`
@@ -347,14 +374,45 @@ is per-peer — see the interval invariant in §4.6.
 A `(peer, bin)` interval records "I have synced everything peer `p` offered in this bin up to BinID
 `X`." With cross-peer dedup, a chunk peer `A` offered may have been fetched from peer `B`. That is
 fine: **advance `A`'s interval to its offer `Topmost` only once every chunk `A` offered in
-`[start_A, Topmost]` is locally held** (fetched from anyone, or already present). If some chunk `A`
-offered is still missing at round end (no holder, or all excluded), advance `A`'s interval only to
-the **contiguous prefix of held BinIDs**, so the gap is retried next round. Never advance past a
-still-missing chunk — that would silently drop it and break O1 (Completeness).
+`[start_A, Topmost]` is locally held — or terminally rejected** (invalid stamp, failed
+hash/SOC validation, `ErrOverwriteNewerChunk` replay): a chunk that can *never* be stored must not
+pin the interval, or resume bookkeeping wedges behind it forever. (Master's `Sync` already advances
+past verification failures — port that exact semantics.) If some chunk `A` offered is still missing
+*and still storable* at round end (no holder, or all excluded), advance `A`'s interval only to the
+**contiguous prefix of held-or-rejected BinIDs**, so the gap is retried next round. Never advance
+past a still-missing storable chunk — that would silently drop it and break O1 (Completeness).
 
 > This is the one place the dedup design interacts non-trivially with the legacy interval
 > bookkeeping. The master puller sidesteps it (each peer fetches everything it offers). Write a
 > dedicated test (§8, `TestIntervalAdvanceAfterCrossPeerFetch`).
+
+This rule is **interval settlement**, with its own refinement spec —
+`optimal-testbed/IntervalSettlement.tla` in the SWIP repo (companion to `PullSyncerE`, in the
+`PullSyncerNA` mould). The interval is pull-sync's only durable claim — `Add(start, x)` says
+*never offer me this range again* — so advancing it is *forgetting*, and the rule is *settle
+before you forget*. The spec verifies both halves and ablates both choices: `MC_settlement`
+(settled-only advance: `NoDrop` — an interval never covers an unsettled chunk — plus completeness
+and interval drain), `MC_settlement_eager` (master's eager advance-to-Topmost under cross-peer
+dedup → `NoDrop` breaks: an unfetched chunk is forgotten, never re-offered), and
+`MC_settlement_noreject` (rejections don't settle → the interval wedges behind a never-storable
+entry; resume liveness, not delivery). The composition: `PullSyncerE` proves *still-offered ⇒
+eventually got*; `IntervalSettlement` proves *nothing is forgotten before it settles*. Read it
+before implementing the advance — it is ~100 lines and it IS §4.6.
+
+Two enforcement points keep the code's surface equal to the proven abstraction:
+
+- **Prefix-only interval usage.** The spec proves the rule over a single high-water mark;
+  `intervalstore.Intervals` is a richer range algebra (master's per-session `Add`s can create
+  disjoint ranges; ours must not). Funnel every interval write through one
+  `advancePrefix(peer, bin, x)` helper, and pin it with `TestIntervalAdvancePrefixOnly`: after
+  any schedule, each `(peer, bin)` interval is a single contiguous range from `start`.
+- **Offer completeness.** Settlement forgets everything at or below the advance, so it is sound
+  only if an offer for `[start, Topmost]` names **every** entry the peer holds in that range.
+  For a Byzantine peer, under-offering is omission — absorbed by supply (the interval is
+  per-peer; forgetting a chunk *from the omitter* costs nothing). For our own server it is an
+  unverified legacy assumption: pin it with `TestOfferNamesEveryHeldEntry` — fill a mock
+  reserve, request offers over ranges (across page boundaries), assert nothing held in-range is
+  absent from the offer.
 
 ### 4.7 Radius changes (keep master's behaviour)
 
@@ -388,13 +446,13 @@ blocklist** — that was a `swip-25d` addition. If you add one, make it a clearl
 operational safeguard with a cooldown, not part of the core correctness story, and keep it behind
 a tunable in `Options` (default off or generous). Don't let it gold-plate the PR.
 
-### 4.10 Concurrency surfaces (the refinement seams the matrix does NOT cover)
+### 4.10 Concurrency surfaces (the refinement obligations the matrix does NOT cover)
 
 The model is a single-process state machine over interleaved atomic actions; the implementation is
 concurrent. Single-goroutine ownership of `pullstate` serializes **every scheduling-state mutation**
 (`want`/`holders`/`arrived`/`excluded`/`load`/`got`), which is what discharges the one atomicity
 obligation (§4.8) and what the model's "one step at a time" assumes. But the refinement crosses
-several seams the TLC proof does **not** see — enumerate them here so what is unverified is explicit,
+several surfaces the TLC proof does **not** see — enumerate them here so what is unverified is explicit,
 not diffuse:
 
 1. **`want` check-and-mark** — the only concurrency surface the *model* exposes (`PullSyncerNA`).
@@ -414,12 +472,15 @@ not diffuse:
 4. **Worker cancellation vs in-flight results.** A `(peer,bin)` worker may be cancelled (radius
    change, disconnect) while a result is in flight. Use **generation tokens** (as master/swip-25d
    do) so the control goroutine drops `Deliver`/`Stall` reports from a superseded worker — else a
-   stale `Deliver` mutates state for a chunk the scheduler has moved on from.
+   stale `Deliver` mutates state for a chunk the scheduler has moved on from. Note this is
+   load-bearing for the §4.1 refinement claim, not hygiene: a stale `Deliver(c,p)` with
+   `p ∉ want[c]` is a step the *model forbids*, so without the tokens the implementation's
+   behaviours are no longer a subset of the model's.
 5. **Statestore intervals + cursor cache.** Genuinely shared between the control goroutine and
    workers; guard with a mutex (the *only* locks in the design). Keep them off the model's
    correctness path — they are resume bookkeeping, not scheduling state.
 
-Seam 1 is proven; 2–5 are implementation obligations the matrix cannot reach. Each deserves a
+Surface 1 is proven; 2–5 are implementation obligations the matrix cannot reach. Each deserves a
 race-tested integration test (§8.2); none should leak into `pullstate`, which stays pure and
 single-threaded.
 
@@ -437,9 +498,9 @@ single-threaded.
 | `pkg/puller/internal/pullstate/pullstate_test.go` (new) | Unit-test the state machine **against the same matrix as `optimal-testbed/run.sh`** (the ablation parity table, §8). |
 | `pkg/puller/puller.go` | Replace per-peer sessions with the single-goroutine I/O shell that drives `pullstate` (§4.5). |
 | `pkg/puller/metrics.go` | Add: deliveries (should ≈ missing-chunk count), dedup-suppressed wants, failovers/exclusions, per-peer load skew, and a **`conflict`** counter (must stay 0 — the `ConflictFree` tripwire, §4.3). These metrics *are* the O3/O5 evidence. |
-| `pkg/puller/export_test.go` | Export the test seams you need (inspect in-flight/holders/load, set the tick interval). Mirror the existing `PeerIntervalKey` export idiom. |
+| `pkg/puller/export_test.go` | Export the test hooks you need (inspect in-flight/holders/load, set the tick interval). Mirror the existing `PeerIntervalKey` export idiom. |
 | `pkg/puller/puller_test.go` | New integration tests per §8. |
-| `pkg/node/node.go` | Only if the `puller.New`/`pullsync.New` signatures change. Keep them identical if you can (the call sites are `node.go:1064` and `node.go:1155`). |
+| `pkg/node/node.go` | Only if the `puller.New`/`pullsync.New` signatures change. Keep them identical if you can (the call sites are `node.go:1168` and `node.go:1258`). |
 
 **Do not touch:** `pkg/pullsync/pb/*`, `pkg/storer/*`, `pkg/topology/*`, anything postage.
 
@@ -508,6 +569,9 @@ Functional (map to the doc's objectives and §9 machine-checked properties):
 8. **Store invariants:** `ndeliv == |got|` (`DeliveryFloor` — no double-fetch), the store only grows
    (`Monotone`), no claim leaks past completion (`Quiescence`), every claim is on a current,
    non-barred holder (`ClaimsLive`). Wire these as runtime assertions/metrics where cheap.
+   Plus the two abstraction-surface pins (§4.6): each `(peer, bin)` interval stays a single
+   contiguous range (`TestIntervalAdvancePrefixOnly`), and the server's offers are complete over
+   their range (`TestOfferNamesEveryHeldEntry`).
 9. **No regressions:** radius increase/decrease, epoch reset, peer disconnect/gone, interval
    persistence/resume all behave as the master tests assert (port those tests).
 10. `go build ./...`, `make lint`, `make test` (and `-race`) green; `goleak` clean (the
@@ -541,14 +605,14 @@ it.
 | `omission` | one holder never delivers (→`Stall`) | same (repaired by failover) | `MC_omission` |
 | `vicinity` | `Priority=true` | same (order correctness-neutral) | `MC_vicinity` |
 | `live` | a `NewChunk` after init | same + `Freshness` | `MC_live` |
-| `timeout` | `TimeoutBudget=2`, single-holder chunk, `ResetOnExhaust=true` | same (misfire costs a round) | `MC_timeout` |
-| `churn` | `ChurnBudget=2` + omitter | same + `SupplyInv` | `MC_churn` |
-| `storm` | k=4 composite: omitter+stall, LIVE-deepest, single-holder, 1 timeout, 1 churn | all hold | `MC_storm` |
+| `timeout` | driver injects 2 spurious `Stall`s on honest holders (≙ `TimeoutBudget=2`), single-holder chunk, `ResetOnExhaust=true` | same (misfire costs a round) | `MC_timeout` |
+| `churn` | driver applies 2 lose/gain events to the offers (≙ `ChurnBudget=2`) + omitter | same + `SupplyInv` | `MC_churn` |
+| `storm` | k=4 composite: omitter+stall, LIVE-deepest, single-holder, 1 injected misfire, 1 churn event | all hold | `MC_storm` |
 | `scale` | k=6, two Byzantine omitters | all hold | `MC_scale` |
 | `nodedup` | `Dedup=false` | **`ConflictFree` breaks** | `MC_nodedup` |
 | `nofailover` | `Failover=false` + omitter | **`Completeness` fails** | `MC_nofailover` |
 | `noexclude` | `Exclude=false` + omitter | **`Completeness` fails** (re-grab livelock) | `MC_noexclude` |
-| `noreset` | `ResetOnExhaust=false`, `TimeoutBudget=1`, single-holder | **`Completeness` fails** (permanent bar) | `MC_noreset` |
+| `noreset` | `ResetOnExhaust=false`, 1 injected misfire, single-holder | **`Completeness` fails** (permanent bar) | `MC_noreset` |
 | `single_omission` | `SingleSource=true`, assigned=omitter | **`Completeness` fails** | `MC_single_omission` |
 | `single_partial` | `SingleSource=true`, assigned lacks it | **`Completeness` fails** | `MC_single_partial` |
 | `no_live` | `EnableLive=false` + a `NewChunk` | **`Freshness` fails** | `MC_no_live` |
@@ -559,6 +623,21 @@ the property does *not* break, the translation is wrong — that is the whole po
 ablations.** (`MC_nonatomic` is the one row that lives in the concurrent integration test, §8.2 /
 `TestOptimal_ConcurrentWantsDedupToOneFetch`, not here — the pure single-goroutine machine can't
 exhibit the TOCTOU.)
+
+Three mechanics so the table is implementable as written:
+
+- **Budgets are driver scripts, not `Config` fields** (§4.2: `tmo`/`chn` are the model's proof
+  device). "≙ `TimeoutBudget=2`" means the test driver calls `Stall` on an honest holder twice at
+  adversarially-chosen points; "churn" means the driver mutates the mock offers (lose: remove a
+  holding, release any claim on it; gain: add one) between rounds. Do **not** add budget fields to
+  `Config`.
+- **The `single_*` rows need an `Assign` map** (`triple → peerKey`) in the test driver — the
+  model's `Assign` constant. It exists only to reproduce the disqualification; it is not
+  production state.
+- **Asserting "fails" finitely.** `Completeness` failure must be detected, not timed out:
+  for `nofailover`/`noreset`/`single_*` it is a **stuck state** — no enabled actions, deficit > 0;
+  for `noexclude` it is a **livelock** — in the BFS, a revisited state with deficit > 0 (a cycle).
+  Never assert liveness failure with a wall-clock timeout.
 
 ### 8.2 Integration scaffold (puller + pullsync over the mocks)
 
@@ -601,14 +680,20 @@ Read it for *how to wire I/O cleanly in this codebase*; ignore it for *what to s
 
 ## 10. Risks & things to verify against source (don't take this brief on faith)
 
-- **Stream lifecycle on `Offer` close.** Confirm against `handler` how to end the stream after
-  reading the Offer without an error log (empty `Want` vs `Reset`). Pick the quiet path.
+- **Stream lifecycle on `Offer` close — answered (verified against `handler`).** Send an empty
+  `Want`: `processWant` returns zero chunks, the server writes nothing and `FullClose`s cleanly
+  (cost: one rate-limiter token, `max(1, 0)`). A client `Reset` instead errors the server's
+  `read want` and gets logged. Use the empty `Want`.
 - **`Fetch` re-offer drift.** The fresh offer in `Fetch` may differ from the one `Offer` saw
-  (new arrivals, evictions). Match `want` by triple and tolerate misses (a wanted ref no longer
-  offered → treat as a stall for that chunk → reschedule). Test it.
+  (new arrivals, evictions, **and pagination**: offers page at `DefaultMaxPage = 250`, so a wanted
+  triple can fall outside the fresh page). Match `want` by triple and tolerate misses (a wanted ref
+  no longer offered → treat as a stall for that chunk → reschedule). Also expected: `makeOffer`
+  deliberately blocks up to `pageTimeout = 1s` on an empty range — the LIVE subscription path — so
+  an `Offer` on a drained bin taking ~1s is by design, not a hang. Test it.
 - **Interval advance** (§4.4) — the one genuinely new correctness subtlety. Single highest-value
   test.
-- **`BinID` is peer-local.** Never compare BinIDs across peers; dedup on address only.
+- **`BinID` is peer-local.** Never match offers across peers by BinID; cross-peer identity is the
+  **triple** (§2) — BinID is only the per-peer resume cursor (§4.6).
 - **Backpressure / rate limit.** Keep the `~1000 chunks/s` puller limiter (`maxChunksPerSecond`)
   and the server-side per-peer limiter. Don't let the offer-gathering fan-out blow past them.
 - **`k ∈ [2,8]`** is small; O(k) scans per chunk are fine. Don't over-engineer the data
