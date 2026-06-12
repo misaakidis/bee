@@ -61,7 +61,7 @@ loses an optimality bound). Plus the LIVE obligation (§5.6).
 | 1 | §5.1 | **Multi-source ≥2**: each missing chunk has ≥2 candidate holders; one fetch at a time, the rest are fallbacks | scheduler: `holders[chunk] = set of peers that offered it` | gate-critical (O1, O6) |
 | 2 | §5.2 | **Chunk-level dedup**: one shared, **triple-keyed** in-flight set; check-and-mark is **one indivisible step** | scheduler: `want map[triple]set[peerKey]`, consulted+set atomically before issuing a `Want` (`DedupInv` keeps it ≤1 in production — see §4.2 for why the type is a set) | gate-critical (O3) |
 | 3 | §5.4 | **Failover-with-exclude-and-reset**: on stall try the next holder and **bar** the staller *for that chunk*; **clear a chunk's bars once they cover every current holder** (`ResetOnExhaust`) | scheduler: `excluded[triple] = barred peers`; reset when `holders\excluded = ∅` | gate-critical (O1, O6) |
-| 4 | §5.3 | **Load-aware routing**: among a chunk's holders, fetch from the **least-loaded**; ties broken by proximity (latency) | scheduler: per-peer outstanding-fetch counter; pick `argmin load` over `holders[c] \ excluded[c]` | floor-achieving (O5) |
+| 4 | §5.3 | **Load-aware routing**: among a chunk's holders, fetch from the **least-assigned** (cumulative), outstanding load then proximity as tiebreaks | scheduler: per-peer cumulative-assignment counter + outstanding-fetch counter; pick `argmin (assigned, outstanding)` over `holders[c] \ excluded[c]`. Cumulative, not outstanding-only: the §5.3 floor is about REALISED serve totals, and outstanding load is history-blind — it balances within a wave but skews across waves (deeper bins schedule first). Measured in the melissi sim: outstanding-only gave `[6,6,12]`; cumulative gives max−min ≤ 1 | floor-achieving (O5) |
 | 5 | §5.5 | **Deepest-first**: fetch the deepest (highest-PO, nearest) bins first | scheduler: iterate bins high→low | floor-achieving (O2) |
 | 6 | §5.6 | **LIVE**: every chunk arriving after the cursor is also pulled | per-bin live subscription continues past the cursor | regime obligation |
 
@@ -313,10 +313,18 @@ chunks claimable). The model picks arbitrarily; the implementation picks determi
 - **Which chunk first:** deepest bin first — already enforced as the `prioOK` *guard*, restricted
   to claimable chunks (§4.3 note; `MC_vicinity` shows ordering correctness-neutral). Within a bin,
   any order.
-- **Which holder:** `p* = argmin load[p]` over `holders[c] \ excluded[c]` (§5.3), ties broken by
-  proximity via `swarm.Proximity` / `swarm.DistanceCmp` (latency + network-wide balance). This is
-  *not* in the model — it only chooses *among already-enabled* `Want`s, so it cannot violate safety;
-  keep it fair so it cannot starve liveness.
+- **Which holder:** `p* = argmin (assigned[p], load[p])` over `holders[c] \ excluded[c]` (§5.3) —
+  `assigned` is the *cumulative* per-peer assignment counter (the realised-totals key the fairness
+  floor is actually about), `load` the outstanding counter as tiebreak, then proximity via
+  `swarm.Proximity` / `swarm.DistanceCmp`. This is *not* in the model — it only chooses *among
+  already-enabled* `Want`s, so it cannot violate safety; keep it fair so it cannot starve liveness.
+- **When:** behind the **discovery barrier** (the design's §5.6 discovery round, measured load-
+  bearing in the melissi sim): schedule a bin only once the choice set is assembled — every known
+  peer has reported cursors, and every peer listing the bin has answered its first offer (or had
+  nothing in the HIST range). Quantify over *known peers*, not peers whose cursors happen to have
+  arrived — else the first peer through discovery looks like the whole choice set and receives the
+  whole backlog (`[6,6,12]` in the sim before the fix). The barrier resolves per bin, latches, and
+  never gates LIVE-phase scheduling (fairness binds only at volume, §5.3).
 
 When `Want(c,p*)` is accepted, the in-flight mark is set **inside the same method call** (the
 `Dedup⇒want[c]={}` check and the `want[c]∪={p}` update are one step — §4.7). `load[p*]++`; the
